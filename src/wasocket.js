@@ -5,10 +5,10 @@ const {
   DisconnectReason,
   downloadMediaMessage,
   useSingleFileAuthState
-} = require('@adiwajshing/baileys');
+} = require('@whiskeysockets/baileys');
 const zlib = require('node:zlib');
 const { encode, decode } = require('uint8-to-base64');
-const makeWASocket = require('@adiwajshing/baileys').default;
+const makeWASocket = require('@whiskeysockets/baileys').default;
 
 const { logger } = require('./utils/logger');
 const { splitBuffer, chunkString } = require('./utils/string-utils');
