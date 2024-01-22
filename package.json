@@ -24,7 +24,7 @@
     "src/**/*.{json}": "prettier --write"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "<latest_version>",
+    "@whiskeysockets/baileys": "^6.6.0",
     "pino": "^8.7.0",
     "pino-pretty": "^9.1.1",
     "qrcode-terminal": "^0.12.0",
