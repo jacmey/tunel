@@ -2,26 +2,43 @@
   wasocket.js
   ------------
   Proyecto educativo: Túnel TCP a través de WhatsApp usando WhiskeySockets/Baileys
+  con soporte experimental para HTTPS mediante el método CONNECT y modo raw.
 
   Flujo:
     - MODO CLIENTE:
-        • Se levanta un servidor TCP local (por ejemplo, en el puerto 9000) que recibe peticiones (ej. desde Firefox).
-        • Cada conexión genera un sessionId y se acumulan datos en un buffer. Cada 500 ms se envía lo acumulado.
-        • Los datos se comprimen y se envían vía WhatsApp (cuenta CLIENTE) al número del servidor.
-        • Al recibir la respuesta vía WhatsApp, se descomprime y se reenvía al socket TCP.
+         • Levanta un servidor TCP local (por defecto en el puerto 9000) que espera conexiones.
+         • Al recibir una nueva conexión, se lee la primera línea:
+             - Si es una petición CONNECT (por ejemplo, "CONNECT www.google.com:443 HTTP/1.1"),
+               se responde inmediatamente con "HTTP/1.1 200 Connection Established\r\n\r\n"
+               y se envía un mensaje JSON de tipo "CONNECT" (con host y puerto) para establecer
+               la conexión raw. Luego, cualquier dato recibido se envía inmediatamente como mensajes
+               de tipo "DATA".
+             - Si es una petición normal (por ejemplo, GET /index.html), se utiliza un buffer con
+               un flush timer (cada 500 ms) para enviar la petición como un mensaje JSON de tipo "REQ".
     - MODO SERVIDOR:
-        • Se conecta a WhatsApp (cuenta SERVIDOR) y espera mensajes de túnel.
-        • Al recibir un mensaje “REQ”, se conecta al proxy configurado, reenvía la petición y, al recibir la respuesta, la comprime y la envía de vuelta vía WhatsApp.
+         • Se conecta a WhatsApp y espera mensajes.
+         • Si recibe un mensaje JSON con tipo "CONNECT", se abre una conexión TCP a (host:port)
+           indicado y se envía un mensaje "CONNECT_RESPONSE" de vuelta.
+         • Si recibe mensajes de tipo "DATA", se reenvían al socket TCP abierto para la sesión raw.
+         • Si recibe mensajes de tipo "REQ", se procesa como una petición HTTP normal conectándose a
+           un proxy (por ejemplo, el script proxy.js).
+         • Se responde con mensajes de tipo "RES" para el flujo normal HTTP.
 
-  Cada modo usa su propia carpeta de autenticación:
+  Cada modo usa una carpeta de autenticación separada:
       • Cliente: "./auth_client"
       • Servidor: "./auth_server"
 
-  Se utiliza inquirer para preguntar el número del servidor (se corrige si es necesario) y chalk para embellecer los logs.
-  
+  Se usa inquirer para solicitar el número de WhatsApp del servidor en el modo CLIENTE
+  y chalk para embellecer los logs.
+
   Uso:
       node wasocket.js client   -> Inicia en modo CLIENTE.
       node wasocket.js server   -> Inicia en modo SERVIDOR.
+      
+  Nota: Este túnel **NO** soporta HTTPS de forma nativa en el sentido de reencriptar datos; se
+  establece un túnel raw a través del que se espera que la negociación TLS se haga directamente
+  entre el navegador y el destino. La latencia y el reensamblaje de mensajes a través de WhatsApp
+  pueden afectar el handshake TLS.
 */
 
 const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
@@ -41,28 +58,26 @@ const chalk = require('chalk');
 
 const MAX_TEXT_LENGTH = 20000;      // Límite para enviar mensaje como texto
 const MAX_FILE_LENGTH = 80000;      // Límite para enviar como archivo (se fragmenta si es mayor)
-const MESSAGE_PREFIX = "WA_TUNNEL"; // (Opcional) Prefijo para identificar mensajes
+const PROTOCOL_ID = "WA_TUNNEL";    // Identificador de nuestro protocolo
 
 // Configuración general
 let config = {
   client: {
-    localTcpPort: 9000, // Puerto en el que el cliente TCP recibirá peticiones (ej. desde Firefox)
-    // Se pedirá al inicio el número de WhatsApp del servidor (formato completo esperado)
-    serverWhatsAppId: "",
+    localTcpPort: 9000, // Puerto donde el cliente TCP escuchará
+    serverWhatsAppId: "", // Se solicitará al inicio
   },
   server: {
-    // Datos del proxy al que se conectará el servidor para reenviar peticiones HTTP
+    // Proxy para peticiones HTTP normales
     proxyHost: '127.0.0.1',
     proxyPort: 1080,
   },
   whatsapp: {
-    // La carpeta de autenticación se asignará según el modo
     authFolder: '',
   }
 };
 
 // ───────────────────────────────────────────────
-// Selección del modo y asignación de la carpeta de autenticación
+// Selección del modo y asignación de carpeta de autenticación
 // ───────────────────────────────────────────────
 
 let currentMode = process.argv[2] || "client";
@@ -70,21 +85,22 @@ if (currentMode !== "client" && currentMode !== "server") {
   console.error(chalk.red("Modo inválido. Usa 'client' o 'server'."));
   process.exit(1);
 }
-
 if (currentMode === "client") {
   config.whatsapp.authFolder = './auth_client';
-} else if (currentMode === "server") {
+} else {
   config.whatsapp.authFolder = './auth_server';
 }
 
 // ───────────────────────────────────────────────
-// Variables Globales
+// Variables globales
 // ───────────────────────────────────────────────
 
 let globalSock = null;  // Instancia actual de WhatsApp
+let pendingSessions = {}; // Mapea sessionId -> { socket, isRaw, buffer, flushTimer }
+let rawSessions = {};     // En modo servidor, mapea sessionId -> TCP socket (conexión raw)
 
 // ───────────────────────────────────────────────
-// Funciones Auxiliares
+// Funciones auxiliares
 // ───────────────────────────────────────────────
 
 function splitIntoChunks(str, size) {
@@ -103,33 +119,23 @@ async function decompressData(data) {
   return await decompress(data);
 }
 
-/*
-  Nuestro protocolo de túnel es un objeto JSON con esta estructura:
-  {
-    direction: "REQ" o "RES",   // "REQ" para solicitudes; "RES" para respuestas.
-    sessionId: "<id único>",      // Identificador de la sesión.
-    // (Opcional) Datos de fragmentación:
-    partIndex: <número de parte>,
-    totalParts: <número total de partes>,
-    payload: "<cadena>"         // Datos comprimidos en base64.
-  }
-*/
-
 // ───────────────────────────────────────────────
-// Envío de mensajes vía WhatsApp (con fragmentación y retraso para evitar spam)
+// Función para enviar mensajes vía WhatsApp
 // ───────────────────────────────────────────────
 
 async function sendTunnelMessage(sock, to, messageObj) {
+  // Aseguramos que el mensaje incluya nuestro identificador
+  messageObj.protocol = PROTOCOL_ID;
   let msgStr = JSON.stringify(messageObj);
   if (msgStr.length <= MAX_TEXT_LENGTH) {
-    console.log(chalk.green("Enviando mensaje de túnel como texto."));
+    console.log(chalk.green(`[SEND] Tipo: ${messageObj.type || "N/A"}, Sesión: ${messageObj.sessionId}`));
     try {
       await sock.sendMessage(to, { text: msgStr });
     } catch (err) {
-      console.error(chalk.red("Error al enviar mensaje:"), err);
+      console.error(chalk.red("[SEND] Error al enviar mensaje:"), err);
     }
   } else {
-    console.log(chalk.green("Mensaje excede límite; enviando como archivo fragmentado."));
+    console.log(chalk.green("[SEND] Mensaje grande; enviando en partes sin caption."));
     let parts = splitIntoChunks(msgStr, MAX_FILE_LENGTH);
     for (let i = 0; i < parts.length; i++) {
       let partObj = {
@@ -138,18 +144,16 @@ async function sendTunnelMessage(sock, to, messageObj) {
         totalParts: parts.length,
         payload: parts[i]
       };
-      let caption = JSON.stringify(partObj);
       let filename = `tunnel_${messageObj.sessionId}_part${i+1}.txt`;
       fs.writeFileSync(filename, parts[i]);
-      console.log(chalk.green(`Enviando parte ${i+1} de ${parts.length} como archivo.`));
+      console.log(chalk.green(`[SEND] Enviando parte ${i+1} de ${parts.length} para la sesión ${messageObj.sessionId}`));
       try {
         await sock.sendMessage(to, { 
           document: fs.readFileSync(filename), 
-          fileName: filename, 
-          caption: caption 
+          fileName: filename 
         });
       } catch (err) {
-        console.error(chalk.red("Error al enviar parte del mensaje:"), err);
+        console.error(chalk.red("[SEND] Error al enviar parte:"), err);
       }
       fs.unlinkSync(filename);
       await new Promise(resolve => setTimeout(resolve, 500));
@@ -158,15 +162,11 @@ async function sendTunnelMessage(sock, to, messageObj) {
 }
 
 // ───────────────────────────────────────────────
-// Ensamblado y procesamiento de mensajes de túnel
+// Procesamiento de mensajes entrantes
 // ───────────────────────────────────────────────
 
-let messageBuffer = {};
-
 async function processTunnelMessage(message, sock, mode) {
-  // Si no existe message.message, se ignora
   if (!message || !message.message) return;
-
   let content = null;
   if (message.message.conversation) {
     content = message.message.conversation;
@@ -177,21 +177,23 @@ async function processTunnelMessage(message, sock, mode) {
   } else {
     return;
   }
-  if (!content.startsWith("{")) return; // No es un mensaje de túnel
-
+  if (!content.startsWith("{")) return;
   let msgObj;
   try {
     msgObj = JSON.parse(content);
   } catch (e) {
-    console.error(chalk.red("Error al parsear JSON:"), e);
+    console.error(chalk.red("[RECV] Error al parsear JSON:"), e);
     return;
   }
-  if (!msgObj.sessionId || !msgObj.direction || !msgObj.payload) return;
-
+  if (msgObj.protocol !== PROTOCOL_ID) return;
+  if (!msgObj.sessionId || !msgObj.type || !msgObj.payload) {
+    // Para peticiones normales, si no se especifica el tipo, se asume "REQ"
+    msgObj.type = msgObj.type || "REQ";
+  }
   // Manejo de fragmentación
   if (msgObj.totalParts && msgObj.totalParts > 1) {
     if (!messageBuffer[msgObj.sessionId]) {
-      messageBuffer[msgObj.sessionId] = { parts: {}, totalParts: msgObj.totalParts, timestamp: Date.now(), direction: msgObj.direction };
+      messageBuffer[msgObj.sessionId] = { parts: {}, totalParts: msgObj.totalParts };
     }
     messageBuffer[msgObj.sessionId].parts[msgObj.partIndex] = msgObj.payload;
     if (Object.keys(messageBuffer[msgObj.sessionId].parts).length === msgObj.totalParts) {
@@ -208,119 +210,155 @@ async function processTunnelMessage(message, sock, mode) {
   }
 }
 
+async function handleTunnelPayload(msgObj, sock, mode, from) {
+  if (msgObj.type === "CONNECT") {
+    if (mode === "server") {
+      await handleConnectMessage(msgObj, sock, from);
+    }
+    return;
+  }
+  if (msgObj.type === "CONNECT_RESPONSE") {
+    if (mode === "client") {
+      console.log(chalk.blue(`Cliente: Recibido CONNECT_RESPONSE para la sesión ${msgObj.sessionId}`));
+      if (pendingSessions[msgObj.sessionId]) {
+         pendingSessions[msgObj.sessionId].isRaw = true;
+      }
+    }
+    return;
+  }
+  if (msgObj.type === "DATA") {
+    if (mode === "server") {
+      await handleDataMessage(msgObj, sock, from);
+    } else if (mode === "client") {
+      let compressedData = Buffer.from(msgObj.payload, 'base64');
+      let data;
+      try {
+         data = await decompressData(compressedData);
+      } catch(e) {
+         console.error(chalk.red("[CLIENT][DATA] Error al descomprimir:"), e);
+         return;
+      }
+      if (pendingSessions[msgObj.sessionId] && pendingSessions[msgObj.sessionId].socket) {
+         pendingSessions[msgObj.sessionId].socket.write(data);
+      }
+    }
+    return;
+  }
+  // Para flujo normal HTTP (REQ y RES)
+  if (msgObj.type === "REQ" && mode === "server") {
+    let compressedData = Buffer.from(msgObj.payload, 'base64');
+    let originalData;
+    try {
+       originalData = (await decompressData(compressedData)).toString();
+    } catch (e) {
+       console.error(chalk.red("[SERVER][REQ] Error al descomprimir:"), e);
+       return;
+    }
+    handleProxyRequest(originalData, sock, from, msgObj.sessionId);
+  } else if (msgObj.type === "RES" && mode === "client") {
+    let compressedData = Buffer.from(msgObj.payload, 'base64');
+    let originalData;
+    try {
+       originalData = (await decompressData(compressedData)).toString();
+    } catch (e) {
+       console.error(chalk.red("[CLIENT][RES] Error al descomprimir:"), e);
+       return;
+    }
+    if (pendingSessions[msgObj.sessionId] && pendingSessions[msgObj.sessionId].socket) {
+      pendingSessions[msgObj.sessionId].socket.write(originalData);
+    }
+  } else {
+    console.log(chalk.gray("[RECV] Mensaje de túnel ignorado o tipo desconocido:"), msgObj.type);
+  }
+}
+
 // ───────────────────────────────────────────────
-// Manejo del payload del túnel
+// Funciones para el modo raw (CONNECT para HTTPS)
 // ───────────────────────────────────────────────
 
-async function handleTunnelPayload(msgObj, sock, mode, from) {
+async function handleConnectMessage(msgObj, sock, from) {
+  let targetHost = msgObj.host;
+  let targetPort = msgObj.port;
+  console.log(chalk.blue(`Servidor: Recibido CONNECT para la sesión ${msgObj.sessionId} a ${targetHost}:${targetPort}`));
+  let targetSocket = net.connect({ host: targetHost, port: targetPort }, () => {
+      console.log(chalk.cyan(`Servidor: Conectado a ${targetHost}:${targetPort} para la sesión ${msgObj.sessionId}`));
+      let responseObj = {
+         type: "CONNECT_RESPONSE",
+         sessionId: msgObj.sessionId,
+         protocol: PROTOCOL_ID
+      };
+      sendTunnelMessage(sock, from, responseObj);
+  });
+  targetSocket.on('data', async (data) => {
+      let rawMsg = {
+         type: "DATA",
+         sessionId: msgObj.sessionId,
+         payload: (await compressData(data)).toString('base64'),
+         protocol: PROTOCOL_ID
+      };
+      await sendTunnelMessage(sock, from, rawMsg);
+  });
+  targetSocket.on('end', () => {
+      console.log(chalk.cyan(`Servidor: Conexión terminada a ${targetHost}:${targetPort} para la sesión ${msgObj.sessionId}`));
+  });
+  targetSocket.on('error', (err) => {
+      console.error(chalk.red(`Error en conexión a ${targetHost}:${targetPort} para la sesión ${msgObj.sessionId}:`), err);
+  });
+  rawSessions[msgObj.sessionId] = targetSocket;
+}
+
+async function handleDataMessage(msgObj, sock, from) {
+  if (!rawSessions[msgObj.sessionId]) {
+    console.error(chalk.red(`No se encontró sesión raw para la sesión ${msgObj.sessionId}`));
+    return;
+  }
   let compressedData = Buffer.from(msgObj.payload, 'base64');
   let data;
   try {
     data = await decompressData(compressedData);
   } catch (e) {
-    console.error(chalk.red("Error al descomprimir datos:"), e);
+    console.error(chalk.red("[SERVER][DATA] Error al descomprimir datos:"), e);
     return;
   }
-  let originalData = data.toString();
-
-  if (msgObj.direction === "REQ" && mode === "server") {
-    console.log(chalk.blue(`Servidor: Recibido REQ para la sesión ${msgObj.sessionId}`));
-    handleProxyRequest(originalData, sock, from, msgObj.sessionId);
-  } else if (msgObj.direction === "RES" && mode === "client") {
-    console.log(chalk.blue(`Cliente: Recibida RES para la sesión ${msgObj.sessionId}`));
-    if (pendingSessions[msgObj.sessionId] && pendingSessions[msgObj.sessionId].socket) {
-      pendingSessions[msgObj.sessionId].socket.write(originalData);
-    }
-  } else {
-    console.log(chalk.gray("Mensaje de túnel ignorado o no coincide con el modo actual."));
-  }
+  rawSessions[msgObj.sessionId].write(data);
 }
 
 // ───────────────────────────────────────────────
-// Gestión de sesiones en el lado CLIENTE (con buffering)
-// ───────────────────────────────────────────────
-
-let pendingSessions = {};
-
-function createClientSession(socket) {
-  const sessionId = uuidv4();
-  const session = {
-    socket: socket,
-    buffer: [],
-    flushTimer: setInterval(async () => {
-      if (session.buffer.length > 0) {
-        const combined = Buffer.concat(session.buffer);
-        session.buffer = [];
-        console.log(chalk.magenta(`Cliente: Enviando buffer para sesión ${sessionId} (${combined.length} bytes)`));
-        try {
-          const compressedData = await compressData(combined);
-          const payloadBase64 = compressedData.toString('base64');
-          const messageObj = {
-            direction: "REQ",
-            sessionId: sessionId,
-            payload: payloadBase64
-          };
-          if (globalSock) {
-            await sendTunnelMessage(globalSock, config.client.serverWhatsAppId, messageObj);
-          } else {
-            console.error(chalk.red("Cliente: No hay conexión WhatsApp disponible."));
-          }
-        } catch (e) {
-          console.error(chalk.red("Error al comprimir datos del buffer:"), e);
-        }
-      }
-    }, 500)
-  };
-  pendingSessions[sessionId] = session;
-  socket.on('end', () => {
-    console.log(chalk.yellow(`Cliente: Conexión TCP terminada para la sesión ${sessionId}`));
-    clearInterval(session.flushTimer);
-    delete pendingSessions[sessionId];
-  });
-  socket.on('error', (err) => {
-    console.error(chalk.red("Error en socket TCP:"), err);
-    clearInterval(session.flushTimer);
-    delete pendingSessions[sessionId];
-  });
-  return sessionId;
-}
-
-// ───────────────────────────────────────────────
-// MODO SERVIDOR: Conexión al proxy
+// Función para manejar peticiones HTTP normales en el servidor
 // ───────────────────────────────────────────────
 
 function handleProxyRequest(data, sock, from, sessionId) {
   let proxyClient = net.connect({ host: config.server.proxyHost, port: config.server.proxyPort }, () => {
-    console.log(chalk.cyan(`Servidor: Conectado al proxy para la sesión ${sessionId}`));
+    console.log(chalk.cyan(`Servidor (HTTP): Conectado al proxy para la sesión ${sessionId}`));
     proxyClient.write(data);
   });
-
   let responseBuffer = "";
-  proxyClient.on('data', async (chunk) => {
+  proxyClient.on('data', (chunk) => {
     responseBuffer += chunk.toString();
   });
   proxyClient.on('end', async () => {
-    console.log(chalk.cyan(`Servidor: Fin de datos del proxy para la sesión ${sessionId}`));
+    console.log(chalk.cyan(`Servidor (HTTP): Fin de datos del proxy para la sesión ${sessionId}`));
     try {
       const compressedResponse = await compressData(responseBuffer);
       const payloadBase64 = compressedResponse.toString('base64');
       const messageObj = {
-        direction: "RES",
+        type: "RES",
         sessionId: sessionId,
-        payload: payloadBase64
+        payload: payloadBase64,
+        protocol: PROTOCOL_ID
       };
       await sendTunnelMessage(sock, from, messageObj);
     } catch (e) {
-      console.error(chalk.red("Error al comprimir respuesta del proxy:"), e);
+      console.error(chalk.red("[SERVER][HTTP] Error al comprimir respuesta del proxy:"), e);
     }
   });
   proxyClient.on('error', (err) => {
-    console.error(chalk.red("Error en conexión con el proxy:"), err);
+    console.error(chalk.red("[SERVER][HTTP] Error en conexión con el proxy:"), err);
   });
 }
 
 // ───────────────────────────────────────────────
-// Conexión con WhatsApp usando WhiskeySockets/Baileys y reconexión básica
+// Conexión con WhatsApp (modo reconexión básica)
 // ───────────────────────────────────────────────
 
 async function initWhatsApp() {
@@ -344,7 +382,11 @@ async function initWhatsApp() {
       try {
         await processTunnelMessage(msg, sock, currentMode);
       } catch (e) {
-        console.error(chalk.red("Error en processTunnelMessage:"), e);
+        if (e.message && e.message.indexOf("Bad MAC") !== -1) {
+          console.warn(chalk.yellow("[RECV] Advertencia de cifrado (Bad MAC)."));
+        } else {
+          console.error(chalk.red("[RECV] Error en processTunnelMessage:"), e);
+        }
       }
     }
   });
@@ -371,17 +413,15 @@ async function initWhatsApp() {
 }
 
 // ───────────────────────────────────────────────
-// MODO CLIENTE: Servidor TCP local para recibir peticiones (ej. de Firefox)
+// MODO CLIENTE: Servidor TCP para recibir conexiones (soporta HTTP y CONNECT)
 // ───────────────────────────────────────────────
 
 async function startClient() {
-  // Se pregunta el número de WhatsApp del servidor
   const answers = await inquirer.prompt([{
     type: 'input',
     name: 'serverNumber',
     message: 'Ingrese el número de WhatsApp del SERVIDOR (formato: 1234567890@s.whatsapp.net):'
   }]);
-  // Si el usuario no incluye "@", se agrega automáticamente el sufijo
   if (!answers.serverNumber.includes('@')) {
     answers.serverNumber = answers.serverNumber + '@s.whatsapp.net';
   }
@@ -390,23 +430,15 @@ async function startClient() {
   await initWhatsApp();
   const tcpServer = net.createServer((socket) => {
     console.log(chalk.magenta("Cliente TCP conectado."));
-    createClientSession(socket);
-    socket.on('data', (data) => {
-      for (let id in pendingSessions) {
-        if (pendingSessions[id].socket === socket) {
-          pendingSessions[id].buffer.push(data);
-        }
-      }
-    });
+    handleNewClientSocket(socket);
   });
-
   tcpServer.listen(config.client.localTcpPort, () => {
     console.log(chalk.green(`Servidor TCP local (cliente) escuchando en el puerto ${config.client.localTcpPort}`));
   });
 }
 
 // ───────────────────────────────────────────────
-// MODO SERVIDOR: Espera mensajes de túnel y reenvía al proxy
+// MODO SERVIDOR: Espera mensajes de túnel y reenvía (para HTTP y CONNECT)
 // ───────────────────────────────────────────────
 
 async function startServer() {
@@ -415,7 +447,7 @@ async function startServer() {
 }
 
 // ───────────────────────────────────────────────
-// Programa Principal: Selección del modo
+// Programa Principal
 // ───────────────────────────────────────────────
 
 (async () => {
