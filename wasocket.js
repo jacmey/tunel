@@ -5,28 +5,30 @@
   
   Funcionalidades:
     - Modo CLIENTE:
-         • Levanta un servidor TCP local (por defecto en el puerto 9000) para recibir conexiones de aplicaciones (navegador, curl, etc.).
+         • Levanta un servidor TCP local (por defecto en el puerto 9000) para recibir conexiones (por ejemplo, de un navegador o curl).
          • Detecta si la petición es CONNECT (para HTTPS) o HTTP normal:
-             - Para CONNECT: responde inmediatamente con "HTTP/1.1 200 Connection Established\r\n\r\n" y envía un mensaje JSON tipo "CONNECT" con host y puerto destino; luego transmite cada dato raw (sin compresión) en mensajes de tipo "DATA".
-             - Para HTTP: acumula datos en un buffer y, cuando se alcanza al menos 20,000 bytes o pasan 2 segundos, envía un mensaje JSON tipo "REQ". Si el mensaje supera el límite, se fragmenta y se envía como archivos (sin caption).
+             - Para CONNECT: responde inmediatamente con "HTTP/1.1 200 Connection Established\r\n\r\n" y envía un mensaje JSON tipo "CONNECT" con host y puerto destino; a partir de ahí, todos los datos se envían en modo raw (sin compresión) como mensajes de tipo "DATA".
+             - Para HTTP: acumula datos en un buffer y, cuando se alcanza al menos 20,000 bytes o han pasado 2 segundos, se envía un mensaje JSON tipo "REQ". Si el mensaje resulta muy grande se fragmenta y se envía como archivos (sin caption).
     - Modo SERVIDOR:
-         • Se conecta a WhatsApp y espera mensajes.
+         • Se conecta a WhatsApp y espera mensajes del túnel.
          • Si recibe un mensaje "CONNECT", abre una conexión TCP al destino y responde con "CONNECT_RESPONSE". En modo raw, los datos se intercambian en mensajes "DATA" sin compresión.
-         • Para peticiones HTTP normales (tipo "REQ"), se conecta a un proxy configurado (por ejemplo, Squid) para reenviar la petición; la respuesta se agrupa (usando un mecanismo de caché), se comprime y se envía como "RES".
+         • Para peticiones HTTP normales (tipo "REQ"), se conecta a un proxy (por ejemplo, Squid en el puerto 3128) y utiliza un mecanismo de caché para agrupar la respuesta durante 300 ms antes de enviar un mensaje "RES" (aquí se aplica compresión para ahorrar datos).
   
-  Cada mensaje se marca con "protocol": "WA_TUNNEL" para filtrar solo el tráfico de nuestro túnel y se descartan mensajes antiguos (más de 30 segundos).
+  Cada mensaje se marca con "protocol": "WA_TUNNEL" y se descartan mensajes antiguos (más de 30 s de antigüedad).
   
-  Se utilizan parámetros de línea de comandos (yargs):
+  Parámetros de línea de comandos (usando yargs):
       --mode (-m): "client" o "server" (default "client")
       --local-port (-p): puerto local para el servidor TCP (default: 9000)
-      --server-wa-num (-s): número de WhatsApp del servidor (sin @s.whatsapp.net) (para modo CLIENTE)
-      --disable-files (-d): boolean para deshabilitar envío de archivos (opcional)
+      --server-wa-num (-s): número de WhatsApp del servidor (sin @s.whatsapp.net) (modo CLIENTE)
+      --disable-files (-d): booleano para deshabilitar el envío de archivos (opcional)
   
   Uso:
       node wasocket.js --mode=client --local-port=9000 --server-wa-num=595994672771
       node wasocket.js --mode=server
   
   NOTA: Para HTTPS se recomienda usar un proxy externo (por ejemplo, Squid) que se encargue del handshake TLS.
+  
+  Si encuentras el error "Cannot find module 'link-preview-js'", deshabilita la generación de link preview configurando la opción "generateLinkPreview" a false al crear el socket (o instala la dependencia con `npm install link-preview-js`).
 */
 
 const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
@@ -46,15 +48,15 @@ const { hideBin } = require('yargs/helpers');
 // CONSTANTES
 // ───────────────────────────────────────────────
 
-const MAX_TEXT_LENGTH = 20000;       // Máximo caracteres para mensaje de texto
-const MAX_FILE_LENGTH = 80000;       // Límite para enviar como archivo (si se excede, se fragmenta)
-const CHUNKSIZE = MAX_TEXT_LENGTH;   // Tamaño de fragmentos para mensajes largos
-const MIN_BUFFER_SIZE = 20000;       // Mínimo de datos acumulados en buffer (HTTP)
-const MAX_BUFFER_WAIT = 2000;        // Tiempo máximo (ms) para esperar a acumular datos
-const PROTOCOL_ID = "WA_TUNNEL";     // Identificador de nuestro protocolo
-const IGNORE_OLD_THRESHOLD = 30;     // Ignorar mensajes con timestamp >30 s de antigüedad
-const RESPONSE_FLUSH_TIMEOUT = 300;  // Tiempo (ms) para agrupar respuestas del proxy
-const DELIMITER = "|||";             // Delimitador (si se usa para separar fragmentos en caché)
+const MAX_TEXT_LENGTH = 20000;       // Máximo para enviar como mensaje de texto
+const MAX_FILE_LENGTH = 80000;       // Límite para enviar como archivo (antes de fragmentar)
+const CHUNKSIZE = MAX_TEXT_LENGTH;   // Tamaño de cada fragmento (para mensajes muy largos)
+const MIN_BUFFER_SIZE = 20000;       // Mínimo de bytes a acumular en buffer (HTTP)
+const MAX_BUFFER_WAIT = 2000;        // Tiempo máximo en ms para esperar a acumular datos (HTTP)
+const PROTOCOL_ID = "WA_TUNNEL";     // Identificador de protocolo
+const IGNORE_OLD_THRESHOLD = 30;     // Ignorar mensajes con timestamp >30 s
+const RESPONSE_FLUSH_TIMEOUT = 300;  // Tiempo en ms para agrupar datos de respuesta del proxy
+const DELIMITER = "|||";             // Delimitador para separar fragmentos (si es necesario)
 
 // ───────────────────────────────────────────────
 // PARÁMETROS DE LÍNEA DE COMANDOS (yargs)
@@ -82,23 +84,26 @@ const argv = yargs(hideBin(process.argv))
     alias: 'd',
     type: 'boolean',
     default: false,
-    describe: 'Deshabilitar envío de archivos (para reducir mensajes)'
+    describe: 'Deshabilitar envío de archivos (para reducir cantidad de mensajes)'
   })
   .help()
   .argv;
 
 let currentMode = argv.mode;
 
-// Configuración general
+// ───────────────────────────────────────────────
+// CONFIGURACIÓN GENERAL
+// ───────────────────────────────────────────────
+
 let config = {
   client: {
     localTcpPort: argv['local-port'],
     serverWhatsAppId: ""  // Se asigna en modo CLIENTE
   },
   server: {
-    // Aquí se configura el proxy que se usará para el flujo HTTP normal (por ejemplo, Squid)
+    // Se recomienda usar un proxy HTTPS robusto, por ejemplo Squid en el puerto 3128.
     proxyHost: '127.0.0.1',
-    proxyPort: 3128,  // Por ejemplo, Squid suele usar 3128 (ajusta según tu configuración)
+    proxyPort: 3128,
   },
   whatsapp: {
     authFolder: ""  // Se asigna según el modo
@@ -111,7 +116,7 @@ if (currentMode === "client") {
   config.whatsapp.authFolder = './auth_server';
 }
 
-// Si en modo CLIENTE se pasa el número del servidor por línea de comandos, lo usamos
+// Si se pasa el número del servidor en modo CLIENTE por línea de comandos
 if (currentMode === "client" && argv.serverWaNum) {
   config.client.serverWhatsAppId = `${argv.serverWaNum}@s.whatsapp.net`;
 }
@@ -120,7 +125,7 @@ if (currentMode === "client" && argv.serverWaNum) {
 // VARIABLES GLOBALES
 // ───────────────────────────────────────────────
 
-let globalSock = null;       // Instancia actual de WhatsApp
+let globalSock = null;       // Instancia de WhatsApp
 let pendingSessions = {};    // CLIENTE: sessionId -> { socket, buffer, isRaw, lastFlushTime, flushTimer }
 let rawSessions = {};        // SERVIDOR (raw HTTPS): sessionId -> socket TCP
 
@@ -141,6 +146,7 @@ function splitIntoChunks(str, size) {
 }
 
 async function compressData(data) {
+  // Para el flujo HTTP normal aplicamos compresión
   return await compress(Buffer.from(data));
 }
 
@@ -150,7 +156,7 @@ async function decompressData(data) {
 
 // ───────────────────────────────────────────────
 // ENVÍO DE MENSAJES VIA WHATSAPP
-// (Para datos HTTP se comprime; para modo raw HTTPS no se comprime)
+// Para datos HTTP se comprime; para modo raw (CONNECT) se envía sin comprimir
 // ───────────────────────────────────────────────
 
 async function sendTunnelMessage(sock, to, messageObj) {
@@ -256,7 +262,7 @@ async function handleConnectMessage(msgObj, sock, from) {
     };
     sendTunnelMessage(sock, from, responseObj);
   });
-  // En modo raw, enviamos los datos sin compresión
+  // En modo raw, enviar los datos sin compresión para preservar el flujo TLS
   targetSocket.on('data', async (data) => {
     let rawMsg = {
        type: "DATA",
@@ -276,10 +282,18 @@ async function handleConnectMessage(msgObj, sock, from) {
 
 async function handleDataMessage(msgObj, sock, from) {
   if (!rawSessions[msgObj.sessionId]) {
-    console.error(chalk.red(`[SERVER][DATA] No se encontró sesión raw para ${msgObj.sessionId}`));
-    return;
+    // Esperar brevemente si aún no se ha registrado la sesión raw
+    let attempts = 0;
+    while (!rawSessions[msgObj.sessionId] && attempts < 3) {
+      await new Promise(r => setTimeout(r, 100));
+      attempts++;
+    }
+    if (!rawSessions[msgObj.sessionId]) {
+      console.error(chalk.red(`[SERVER][DATA] No se encontró sesión raw para ${msgObj.sessionId}`));
+      return;
+    }
   }
-  // En modo raw, decodificar sin descomprimir
+  // En modo raw, decodificar sin descompresión
   let data = Buffer.from(msgObj.payload, 'base64');
   rawSessions[msgObj.sessionId].write(data);
 }
@@ -324,7 +338,7 @@ function cacheProxyData(sessionId, chunk, sock, from) {
 }
 
 // ───────────────────────────────────────────────
-// Manejo de peticiones HTTP en el SERVIDOR (usando un proxy externo)
+// Manejo de peticiones HTTP en el SERVIDOR (Usando un proxy externo)
 // ───────────────────────────────────────────────
 
 function handleProxyRequest(data, sock, from, sessionId) {
@@ -428,7 +442,7 @@ async function handleTunnelPayload(msgObj, sock, mode, from) {
     }
     return;
   }
-  // Flujo normal HTTP
+  // Flujo HTTP normal
   if (msgObj.type === "REQ" && mode === "server") {
     let compressedData = Buffer.from(msgObj.payload, 'base64');
     let originalData;
@@ -460,6 +474,45 @@ async function handleTunnelPayload(msgObj, sock, mode, from) {
 // MODO SERVIDOR: Manejo de peticiones HTTP (Proxy con caché de respuesta)
 // ───────────────────────────────────────────────
 
+function flushResponseCache(sessionId, sock, from) {
+  if (!responseCache[sessionId] || responseCache[sessionId].length === 0) return;
+  const buffers = responseCache[sessionId];
+  delete responseCache[sessionId];
+  if (responseCacheTimers[sessionId]) {
+    clearTimeout(responseCacheTimers[sessionId]);
+    delete responseCacheTimers[sessionId];
+  }
+  const combined = Buffer.concat(buffers);
+  compressData(combined)
+    .then((compressedData) => {
+      const payloadBase64 = compressedData.toString('base64');
+      const messageObj = {
+        type: "RES",
+        sessionId: sessionId,
+        payload: payloadBase64
+      };
+      sendTunnelMessage(sock, from, messageObj);
+    })
+    .catch((err) => {
+      console.error(chalk.red("[SERVER][HTTP] Error al comprimir datos cacheados:"), err);
+    });
+}
+
+function cacheProxyData(sessionId, chunk, sock, from) {
+  if (!responseCache[sessionId]) {
+    responseCache[sessionId] = [];
+  }
+  responseCache[sessionId].push(chunk);
+  if (responseCacheTimers[sessionId]) clearTimeout(responseCacheTimers[sessionId]);
+  responseCacheTimers[sessionId] = setTimeout(() => {
+    flushResponseCache(sessionId, sock, from);
+  }, RESPONSE_FLUSH_TIMEOUT);
+}
+
+// ───────────────────────────────────────────────
+// Manejo de peticiones HTTP en el SERVIDOR (Usando proxy externo)
+// ───────────────────────────────────────────────
+
 function handleProxyRequest(data, sock, from, sessionId) {
   let proxyClient = net.connect({ host: config.server.proxyHost, port: config.server.proxyPort }, () => {
     console.log(chalk.cyan(`[SERVER][HTTP] Conectado al proxy para sesión ${sessionId}`));
@@ -481,7 +534,7 @@ function handleProxyRequest(data, sock, from, sessionId) {
 }
 
 // ───────────────────────────────────────────────
-// CONEXIÓN CON WHATSAPP Y MANEJO DE RECONEXIÓN
+// Conexión con WhatsApp y manejo básico de reconexión
 // ───────────────────────────────────────────────
 
 async function initWhatsApp() {
@@ -489,10 +542,12 @@ async function initWhatsApp() {
   const { version, isLatest } = await fetchLatestBaileysVersion();
   console.log(chalk.green(`Usando WhiskeySockets/Baileys v${version} (isLatest: ${isLatest})`));
   
+  // Deshabilitamos la generación de link preview para evitar el error "Cannot find module 'link-preview-js'"
   const sock = makeWASocket({
     version,
     printQRInTerminal: true,
     auth: state,
+    generateLinkPreview: false
   });
   globalSock = sock;
   sock.ev.on('creds.update', saveCreds);
@@ -577,7 +632,7 @@ async function startClient() {
           port: targetPort
         };
         sendTunnelMessage(globalSock, config.client.serverWhatsAppId, connectMsg);
-        // En modo raw, enviar cada dato sin compresión
+        // En modo raw, enviar cada dato recibido sin compresión
         socket.on('data', async (chunk) => {
           let rawMsg = {
             type: "DATA",
