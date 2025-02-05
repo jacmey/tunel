@@ -4,11 +4,12 @@
   Túnel TCP/HTTP/HTTPS a través de WhatsApp usando WhiskeySockets/Baileys.
   
   Arquitectura:
-    - El cliente levanta un servidor TCP local (por defecto en el puerto 9000) y envía 
+    - El cliente levanta un servidor TCP local (por defecto en el puerto 9000) y envía
       peticiones (HTTP o CONNECT) a través de WhatsApp.
-    - El servidor se conecta a WhatsApp, reensambla las peticiones y, para solicitudes 
+    - El servidor se conecta a WhatsApp, reensambla las peticiones y, para solicitudes
       HTTP normales, las reenvía a un proxy externo (Squid). Para peticiones CONNECT (HTTPS),
-      el servidor se conecta a Squid, envía la petición CONNECT y Squid se encarga del handshake TLS.
+      el servidor se conecta a Squid, envía la petición CONNECT y “bufferiza” la respuesta
+      hasta que detecta el final de los encabezados, enviando ese bloque completo al cliente.
   
   Parámetros (yargs):
     --mode (-m): "client" o "server" (default "client")
@@ -21,11 +22,11 @@
     node wasocket.js --mode=server
   
   NOTA:
-    - En el modo CONNECT (HTTPS), se envían los datos en “modo raw” (sin compresión) para 
+    - En el modo CONNECT (HTTPS), se envían los datos en “modo raw” (sin compresión) para
       preservar la secuencia exacta necesaria para TLS.
     - El servidor se conecta a Squid (configurado en 127.0.0.1:3128) para que éste se encargue
       del handshake TLS.
-    - Si aparece el error "Cannot find module 'link-preview-js'", se deshabilita la generación de link preview.
+    - Si aparece "Cannot find module 'link-preview-js'", se deshabilita la generación de link preview.
 */
 
 const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
@@ -45,15 +46,15 @@ const { hideBin } = require('yargs/helpers');
 // CONSTANTES
 // ───────────────────────────────────────────────
 
-const MAX_TEXT_LENGTH = 20000;       // Máximo caracteres para mensaje de texto
-const MAX_FILE_LENGTH = 80000;       // Límite para enviar como archivo (antes de fragmentar)
-const CHUNKSIZE = MAX_TEXT_LENGTH;   // Tamaño de fragmento para mensajes largos
-const MIN_BUFFER_SIZE = 20000;       // Mínimo de bytes a acumular en buffer (HTTP)
-const MAX_BUFFER_WAIT = 2000;        // Tiempo máximo en ms para esperar a acumular datos (HTTP)
-const PROTOCOL_ID = "WA_TUNNEL";     // Identificador de protocolo
-const IGNORE_OLD_THRESHOLD = 30;     // Ignorar mensajes con timestamp >30 s
-const RESPONSE_FLUSH_TIMEOUT = 300;  // Tiempo en ms para agrupar respuestas del proxy
-const DELIMITER = "|||";             // (Opcional) delimitador para fragmentos (aquí usamos índices)
+const MAX_TEXT_LENGTH = 20000;
+const MAX_FILE_LENGTH = 80000;
+const CHUNKSIZE = MAX_TEXT_LENGTH;
+const MIN_BUFFER_SIZE = 20000;
+const MAX_BUFFER_WAIT = 2000;
+const PROTOCOL_ID = "WA_TUNNEL";
+const IGNORE_OLD_THRESHOLD = 30;
+const RESPONSE_FLUSH_TIMEOUT = 300;
+const DELIMITER = "|||";
 
 // ───────────────────────────────────────────────
 // PARÁMETROS DE LÍNEA DE COMANDOS (yargs)
@@ -98,7 +99,6 @@ let config = {
     serverWhatsAppId: ""
   },
   server: {
-    // Configuramos el proxy (Squid) para conexiones HTTPS. Squid se encargará de la negociación TLS.
     proxyHost: '127.0.0.1',
     proxyPort: 3128,
   },
@@ -121,9 +121,9 @@ if (currentMode === "client" && argv.serverWaNum) {
 // ───────────────────────────────────────────────
 
 let globalSock = null;
-let pendingSessions = {};    // CLIENTE: sessionId -> { socket, buffer, isRaw, lastFlushTime, flushTimer }
-let rawSessions = {};        // SERVIDOR: sessionId -> TCP socket (conectado a Squid)
-const responseCache = {};    // SERVIDOR: sessionId -> array de Buffer
+let pendingSessions = {};   // CLIENTE: sessionId -> { socket, buffer, isRaw, lastFlushTime, flushTimer }
+let rawSessions = {};       // SERVIDOR: sessionId -> socket (conectado a Squid)
+const responseCache = {};   // SERVIDOR: sessionId -> array de Buffer
 const responseCacheTimers = {}; // SERVIDOR: sessionId -> timer
 
 // ───────────────────────────────────────────────
@@ -236,57 +236,55 @@ function createClientSession(socket) {
 }
 
 // ───────────────────────────────────────────────
-// FUNCIONES PARA SOPORTAR HTTPS (Modo Raw CONNECT)
+// FUNCIONES PARA SOPORTAR HTTPS (Modo Raw CONNECT) CON BUFFERIZADO DEL HANDSHAKE
 // ───────────────────────────────────────────────
 
-// Aquí modificamos handleConnectMessage para que el servidor se conecte a Squid
-// y le envíe una petición CONNECT con el host y puerto destino.
 async function handleConnectMessage(msgObj, sock, from) {
   const targetHost = msgObj.host;
   const targetPort = msgObj.port;
   console.log(chalk.blue(`[SERVER][CONNECT] Recibido CONNECT para sesión ${msgObj.sessionId} a ${targetHost}:${targetPort}`));
   
-  // Conéctate a Squid
+  // Conéctate a Squid para que éste maneje el handshake TLS
   let proxySocket = net.connect({ host: config.server.proxyHost, port: config.server.proxyPort }, () => {
-    console.log(chalk.cyan(`[SERVER][CONNECT] Conectado a Squid en ${config.server.proxyHost}:${config.server.proxyPort} para sesión ${msgObj.sessionId}`));
-    // Enviar la petición CONNECT a Squid:
+    console.log(chalk.cyan(`[SERVER][CONNECT] Conectado a Squid (${config.server.proxyHost}:${config.server.proxyPort}) para sesión ${msgObj.sessionId}`));
+    // Enviar la petición CONNECT a Squid
     const connectRequest = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n\r\n`;
     proxySocket.write(connectRequest);
   });
   
-  let dataBuffer = "";
+  let handshakeBuffer = "";
+  let handshakeSent = false;
+  
   proxySocket.on('data', async (data) => {
-    dataBuffer += data.toString();
-    if (dataBuffer.indexOf("\r\n\r\n") !== -1) {
-      // Asumimos que se recibió la respuesta completa de Squid
-      if (dataBuffer.startsWith("HTTP/1.1 200")) {
-        console.log(chalk.cyan(`[SERVER][CONNECT] Squid respondió 200 para sesión ${msgObj.sessionId}`));
-        let responseObj = { type: "CONNECT_RESPONSE", sessionId: msgObj.sessionId };
+    // Acumula datos en handshakeBuffer hasta que se detecte el final de los encabezados
+    handshakeBuffer += data.toString();
+    if (!handshakeSent && handshakeBuffer.indexOf("\r\n\r\n") !== -1) {
+      // Se detectó el final de los encabezados; enviar todo el bloque en un solo mensaje
+      if (handshakeBuffer.startsWith("HTTP/1.1 200")) {
+        console.log(chalk.cyan(`[SERVER][CONNECT] Handshake recibido completo para sesión ${msgObj.sessionId}`));
+        let responseObj = { type: "CONNECT_RESPONSE", sessionId: msgObj.sessionId, payload: Buffer.from(handshakeBuffer).toString('base64') };
         await sendTunnelMessage(sock, from, responseObj);
-        // Si hay datos adicionales, enviarlos como DATA
-        let remaining = dataBuffer.split("\r\n\r\n")[1];
-        if (remaining && remaining.length > 0) {
-          let rawMsg = { type: "DATA", sessionId: msgObj.sessionId, payload: Buffer.from(remaining).toString('base64') };
-          await sendTunnelMessage(sock, from, rawMsg);
-        }
-        // Ahora, configurar el manejo raw: cada dato recibido se envía sin comprimir
-        proxySocket.on('data', async (chunk) => {
-          let rawMsg = { type: "DATA", sessionId: msgObj.sessionId, payload: chunk.toString('base64') };
-          await sendTunnelMessage(sock, from, rawMsg);
-        });
+        handshakeSent = true;
       } else {
-        console.error(chalk.red(`[SERVER][CONNECT] Squid respondió error: ${dataBuffer} para sesión ${msgObj.sessionId}`));
+        console.error(chalk.red(`[SERVER][CONNECT] Error en handshake recibido: ${handshakeBuffer}`));
         proxySocket.destroy();
       }
+    } else if (handshakeSent) {
+      // Después del handshake, se envían los datos en modo raw sin compresión
+      let rawMsg = { type: "DATA", sessionId: msgObj.sessionId, payload: data.toString('base64') };
+      await sendTunnelMessage(sock, from, rawMsg);
     }
   });
+  
   proxySocket.on('error', (err) => {
     console.error(chalk.red(`[SERVER][CONNECT] Error en conexión con Squid para sesión ${msgObj.sessionId}:`), err);
     proxySocket.destroy();
   });
+  
   proxySocket.on('end', () => {
     console.log(chalk.cyan(`[SERVER][CONNECT] Conexión con Squid terminada para sesión ${msgObj.sessionId}`));
   });
+  
   rawSessions[msgObj.sessionId] = proxySocket;
 }
 
@@ -365,15 +363,10 @@ async function processTunnelMessage(message, sock, mode) {
   if (message.messageTimestamp && message.messageTimestamp < now - IGNORE_OLD_THRESHOLD) return;
   if (!message || !message.message) return;
   let content = null;
-  if (message.message.conversation) {
-    content = message.message.conversation;
-  } else if (message.message.extendedTextMessage && message.message.extendedTextMessage.text) {
-    content = message.message.extendedTextMessage.text;
-  } else if (message.message.documentMessage && message.message.documentMessage.caption) {
-    content = message.message.documentMessage.caption;
-  } else {
-    return;
-  }
+  if (message.message.conversation) content = message.message.conversation;
+  else if (message.message.extendedTextMessage && message.message.extendedTextMessage.text) content = message.message.extendedTextMessage.text;
+  else if (message.message.documentMessage && message.message.documentMessage.caption) content = message.message.documentMessage.caption;
+  else return;
   if (!content.startsWith("{")) return;
   let msgObj;
   try {
@@ -385,7 +378,7 @@ async function processTunnelMessage(message, sock, mode) {
   if (msgObj.protocol !== PROTOCOL_ID) return;
   if (!msgObj.sessionId || !msgObj.type || !msgObj.payload) msgObj.type = msgObj.type || "REQ";
   
-  // Manejo de fragmentación basado en índices
+  // Manejo de fragmentación mediante índices
   if (msgObj.totalParts && msgObj.totalParts > 1) {
     if (!globalThis.messageBuffer) globalThis.messageBuffer = {};
     if (!globalThis.messageBuffer[msgObj.sessionId]) {
@@ -588,7 +581,6 @@ async function startClient() {
         pendingSessions[sessionId] = { socket: socket, buffer: [], isRaw: true };
         const connectMsg = { type: "CONNECT", sessionId: sessionId, host: targetHost, port: targetPort };
         sendTunnelMessage(globalSock, config.client.serverWhatsAppId, connectMsg);
-        // En modo raw, enviar cada dato recibido sin compresión
         socket.on('data', async (chunk) => {
           let rawMsg = { type: "DATA", sessionId: sessionId, payload: chunk.toString('base64') };
           await sendTunnelMessage(globalSock, config.client.serverWhatsAppId, rawMsg);
