@@ -4,12 +4,13 @@
   Túnel TCP/HTTP/HTTPS a través de WhatsApp usando WhiskeySockets/Baileys.
   
   Arquitectura:
-    - El cliente levanta un servidor TCP local (por defecto en el puerto 9000) y envía
+    - El cliente levanta un servidor TCP local (por defecto en el puerto 9000) y envía 
       peticiones (HTTP o CONNECT) a través de WhatsApp.
     - El servidor se conecta a WhatsApp, reensambla las peticiones y, para solicitudes
       HTTP normales, las reenvía a un proxy externo (Squid). Para peticiones CONNECT (HTTPS),
-      el servidor se conecta a Squid, envía la petición CONNECT y “bufferiza” la respuesta
-      hasta que detecta el final de los encabezados, enviando ese bloque completo al cliente.
+      el servidor se conecta a Squid, envía la petición CONNECT y bufferiza la respuesta 
+      hasta detectar el final de los encabezados (\r\n\r\n) y la envía en un solo mensaje 
+      CONNECT_RESPONSE al cliente. Después, el flujo se continúa en modo raw (sin compresión).
   
   Parámetros (yargs):
     --mode (-m): "client" o "server" (default "client")
@@ -26,6 +27,8 @@
       preservar la secuencia exacta necesaria para TLS.
     - El servidor se conecta a Squid (configurado en 127.0.0.1:3128) para que éste se encargue
       del handshake TLS.
+    - Se han agregado manejos globales de errores para evitar que errores no capturados detengan
+      el proceso.
     - Si aparece "Cannot find module 'link-preview-js'", se deshabilita la generación de link preview.
 */
 
@@ -46,15 +49,15 @@ const { hideBin } = require('yargs/helpers');
 // CONSTANTES
 // ───────────────────────────────────────────────
 
-const MAX_TEXT_LENGTH = 20000;
-const MAX_FILE_LENGTH = 80000;
-const CHUNKSIZE = MAX_TEXT_LENGTH;
-const MIN_BUFFER_SIZE = 20000;
-const MAX_BUFFER_WAIT = 2000;
-const PROTOCOL_ID = "WA_TUNNEL";
-const IGNORE_OLD_THRESHOLD = 30;
-const RESPONSE_FLUSH_TIMEOUT = 300;
-const DELIMITER = "|||";
+const MAX_TEXT_LENGTH = 20000;       // Límite para enviar en un mensaje de texto
+const MAX_FILE_LENGTH = 80000;       // Límite para enviar como archivo (antes de fragmentar)
+const CHUNKSIZE = MAX_TEXT_LENGTH;   // Tamaño de fragmento para mensajes largos
+const MIN_BUFFER_SIZE = 20000;       // Mínimo de bytes en buffer para HTTP
+const MAX_BUFFER_WAIT = 2000;        // Tiempo máximo en ms para esperar a acumular datos (HTTP)
+const PROTOCOL_ID = "WA_TUNNEL";     // Identificador de protocolo
+const IGNORE_OLD_THRESHOLD = 30;     // Ignorar mensajes con timestamp >30 s
+const RESPONSE_FLUSH_TIMEOUT = 300;  // Tiempo en ms para agrupar respuestas del proxy
+const DELIMITER = "|||";             // (Opcional) delimitador (no se usa en este ejemplo)
 
 // ───────────────────────────────────────────────
 // PARÁMETROS DE LÍNEA DE COMANDOS (yargs)
@@ -99,6 +102,7 @@ let config = {
     serverWhatsAppId: ""
   },
   server: {
+    // Configuración del proxy Squid: se asume que Squid escucha en 127.0.0.1:3128
     proxyHost: '127.0.0.1',
     proxyPort: 3128,
   },
@@ -121,9 +125,9 @@ if (currentMode === "client" && argv.serverWaNum) {
 // ───────────────────────────────────────────────
 
 let globalSock = null;
-let pendingSessions = {};   // CLIENTE: sessionId -> { socket, buffer, isRaw, lastFlushTime, flushTimer }
-let rawSessions = {};       // SERVIDOR: sessionId -> socket (conectado a Squid)
-const responseCache = {};   // SERVIDOR: sessionId -> array de Buffer
+let pendingSessions = {};    // CLIENTE: sessionId -> { socket, buffer, isRaw, lastFlushTime, flushTimer }
+let rawSessions = {};        // SERVIDOR: sessionId -> socket (conectado a Squid)
+const responseCache = {};    // SERVIDOR: sessionId -> array de Buffer
 const responseCacheTimers = {}; // SERVIDOR: sessionId -> timer
 
 // ───────────────────────────────────────────────
@@ -244,10 +248,10 @@ async function handleConnectMessage(msgObj, sock, from) {
   const targetPort = msgObj.port;
   console.log(chalk.blue(`[SERVER][CONNECT] Recibido CONNECT para sesión ${msgObj.sessionId} a ${targetHost}:${targetPort}`));
   
-  // Conéctate a Squid para que éste maneje el handshake TLS
+  // Conéctate a Squid
   let proxySocket = net.connect({ host: config.server.proxyHost, port: config.server.proxyPort }, () => {
     console.log(chalk.cyan(`[SERVER][CONNECT] Conectado a Squid (${config.server.proxyHost}:${config.server.proxyPort}) para sesión ${msgObj.sessionId}`));
-    // Enviar la petición CONNECT a Squid
+    // Enviar la petición CONNECT completa a Squid
     const connectRequest = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n\r\n`;
     proxySocket.write(connectRequest);
   });
@@ -256,23 +260,33 @@ async function handleConnectMessage(msgObj, sock, from) {
   let handshakeSent = false;
   
   proxySocket.on('data', async (data) => {
-    // Acumula datos en handshakeBuffer hasta que se detecte el final de los encabezados
     handshakeBuffer += data.toString();
+    // Cuando se detecta el final de los encabezados, enviar el bloque completo en un solo mensaje
     if (!handshakeSent && handshakeBuffer.indexOf("\r\n\r\n") !== -1) {
-      // Se detectó el final de los encabezados; enviar todo el bloque en un solo mensaje
       if (handshakeBuffer.startsWith("HTTP/1.1 200")) {
         console.log(chalk.cyan(`[SERVER][CONNECT] Handshake recibido completo para sesión ${msgObj.sessionId}`));
-        let responseObj = { type: "CONNECT_RESPONSE", sessionId: msgObj.sessionId, payload: Buffer.from(handshakeBuffer).toString('base64') };
+        let responseObj = { 
+          type: "CONNECT_RESPONSE", 
+          sessionId: msgObj.sessionId, 
+          payload: Buffer.from(handshakeBuffer).toString('base64') 
+        };
         await sendTunnelMessage(sock, from, responseObj);
         handshakeSent = true;
+        // Limpia el buffer para la siguiente fase
+        handshakeBuffer = "";
+        // Una vez enviado el handshake, configura el envío raw de los siguientes datos
+        proxySocket.on('data', async (chunk) => {
+          let rawMsg = { 
+            type: "DATA", 
+            sessionId: msgObj.sessionId, 
+            payload: chunk.toString('base64') 
+          };
+          await sendTunnelMessage(sock, from, rawMsg);
+        });
       } else {
         console.error(chalk.red(`[SERVER][CONNECT] Error en handshake recibido: ${handshakeBuffer}`));
         proxySocket.destroy();
       }
-    } else if (handshakeSent) {
-      // Después del handshake, se envían los datos en modo raw sin compresión
-      let rawMsg = { type: "DATA", sessionId: msgObj.sessionId, payload: data.toString('base64') };
-      await sendTunnelMessage(sock, from, rawMsg);
     }
   });
   
@@ -363,10 +377,15 @@ async function processTunnelMessage(message, sock, mode) {
   if (message.messageTimestamp && message.messageTimestamp < now - IGNORE_OLD_THRESHOLD) return;
   if (!message || !message.message) return;
   let content = null;
-  if (message.message.conversation) content = message.message.conversation;
-  else if (message.message.extendedTextMessage && message.message.extendedTextMessage.text) content = message.message.extendedTextMessage.text;
-  else if (message.message.documentMessage && message.message.documentMessage.caption) content = message.message.documentMessage.caption;
-  else return;
+  if (message.message.conversation) {
+    content = message.message.conversation;
+  } else if (message.message.extendedTextMessage && message.message.extendedTextMessage.text) {
+    content = message.message.extendedTextMessage.text;
+  } else if (message.message.documentMessage && message.message.documentMessage.caption) {
+    content = message.message.documentMessage.caption;
+  } else {
+    return;
+  }
   if (!content.startsWith("{")) return;
   let msgObj;
   try {
@@ -378,7 +397,7 @@ async function processTunnelMessage(message, sock, mode) {
   if (msgObj.protocol !== PROTOCOL_ID) return;
   if (!msgObj.sessionId || !msgObj.type || !msgObj.payload) msgObj.type = msgObj.type || "REQ";
   
-  // Manejo de fragmentación mediante índices
+  // Manejo de fragmentación (usando índices)
   if (msgObj.totalParts && msgObj.totalParts > 1) {
     if (!globalThis.messageBuffer) globalThis.messageBuffer = {};
     if (!globalThis.messageBuffer[msgObj.sessionId]) {
@@ -428,14 +447,22 @@ async function handleTunnelPayload(msgObj, sock, mode, from) {
   if (msgObj.type === "REQ" && mode === "server") {
     let compressedData = Buffer.from(msgObj.payload, 'base64');
     let originalData;
-    try { originalData = (await decompressData(compressedData)).toString(); }
-    catch (e) { console.error(chalk.red("[SERVER][REQ] Error al descomprimir:"), e); return; }
+    try {
+       originalData = (await decompressData(compressedData)).toString();
+    } catch (e) {
+       console.error(chalk.red("[SERVER][REQ] Error al descomprimir:"), e);
+       return;
+    }
     handleProxyRequest(originalData, sock, from, msgObj.sessionId);
   } else if (msgObj.type === "RES" && mode === "client") {
     let compressedData = Buffer.from(msgObj.payload, 'base64');
     let originalData;
-    try { originalData = (await decompressData(compressedData)).toString(); }
-    catch (e) { console.error(chalk.red("[CLIENT][RES] Error al descomprimir:"), e); return; }
+    try {
+       originalData = (await decompressData(compressedData)).toString();
+    } catch (e) {
+       console.error(chalk.red("[CLIENT][RES] Error al descomprimir:"), e);
+       return;
+    }
     if (pendingSessions[msgObj.sessionId] && pendingSessions[msgObj.sessionId].socket) {
       pendingSessions[msgObj.sessionId].socket.write(originalData);
     }
@@ -581,6 +608,7 @@ async function startClient() {
         pendingSessions[sessionId] = { socket: socket, buffer: [], isRaw: true };
         const connectMsg = { type: "CONNECT", sessionId: sessionId, host: targetHost, port: targetPort };
         sendTunnelMessage(globalSock, config.client.serverWhatsAppId, connectMsg);
+        // En modo raw, enviar cada dato recibido sin comprimir
         socket.on('data', async (chunk) => {
           let rawMsg = { type: "DATA", sessionId: sessionId, payload: chunk.toString('base64') };
           await sendTunnelMessage(globalSock, config.client.serverWhatsAppId, rawMsg);
